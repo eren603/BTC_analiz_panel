@@ -1,7 +1,22 @@
 #!/usr/bin/env python3
 """
-leading_karar.py  v7.1  -  LONG-ONLY + OTOMATIK auto_fetch
+leading_karar.py  v7.2  -  Tier 3 agirligi yarilandi (Eren talep)
 ========================================================================
+
+V7.2 DEGISIKLIK (May 2 — Eren reconstruction case sonrasi):
+  - Tier 3 (DIVERGENCE/MOMENTUM) agirliklari /2:
+      CVD divergence:  +/-1.5  -> +/-0.75
+      ls_slope:        +/-0.5  -> +/-0.25
+                       +/-0.3  -> +/-0.15
+      OI momentum:     +/-1.0  -> +/-0.5
+                       +/-0.5  -> +/-0.25
+  - Sebep: Reconstructed Eren snapshot 23:48 UTC -> +3.00 BEKLE der
+    ama gercekte 75 dk sonra +%0.96 PUMP oldu (kacirilan firsat).
+  - Tier 1 (live: depth/CVD/funding) GUCLU LONG sinyali Tier 3 (historical
+    exhaustion) negatifleriyle bastirildi. Live > historical felsefesi.
+  - Bu degisiklik n=35 backtest'i ETKILEMEZ (CSV'de Tier 3 verileri yok).
+  - Risk analizi: clear bull (T2 yuksek) durumlarda iki versiyon AYNI karar.
+    Sadece T1+ T2 zayif + T3 negatif (squeeze) durumlarda fark olusur.
 
 V7.1 DEGISIKLIK (May 2 — Eren talep):
   - TEK TUS: r_update.json yoksa veya 5 dk'dan eski ise otomatik
@@ -34,10 +49,10 @@ PUAN BILESENLERI (her biri -3..+3):
     - LS_1h zone (Notion empirik kalibre)       : -1..+2.5
     - whale zone (Notion empirik)               : -1..+2
     - depl_4h zone                              : -1..+1
-  Tier 3 DIVERGENCE (max ±2):
-    - CVD 5m vs 1h zit yon = exhaustion         : ±1.5
-    - ls_slope direction                        : ±0.5
-    - OI momentum + price                       : ±1
+  Tier 3 DIVERGENCE (V7.2: agirlik /2, max ±1):
+    - CVD 5m vs 1h zit yon = exhaustion         : ±0.75
+    - ls_slope direction                        : ±0.25
+    - OI momentum + price                       : ±0.5
   Tier 4 EMPIRIK BONUS:
     - Notion R1-R5 fired                        : +1 ek
 
@@ -242,30 +257,32 @@ def score_depl(d4h):
 
 
 def score_divergence(d5m, d1h):
-    """CVD 5m vs 1h zit yön = exhaustion."""
+    """CVD 5m vs 1h zit yön = exhaustion. V7.2: agirlik /2 (1.5 -> 0.75)."""
     c5 = float(d5m.get("futures_cvd", 0))
     c1 = float(d1h.get("futures_cvd", 0))
     if abs(c5) < CVD_HAFIF or abs(c1) < CVD_HAFIF:
         return 0.0, None
     if c5 > 0 and c1 < 0:
-        return -1.5, f"CVD div: 5m+ vs 1h- = rally exhaustion (SHORT sinyali)"
+        return -0.75, f"CVD div: 5m+ vs 1h- = rally exhaustion (SHORT sinyali)"
     if c5 < 0 and c1 > 0:
-        return +1.5, f"CVD div: 5m- vs 1h+ = dip exhaustion (LONG sinyali)"
+        return +0.75, f"CVD div: 5m- vs 1h+ = dip exhaustion (LONG sinyali)"
     return 0.0, None
 
 
 def score_ls_slope(d1h):
+    """V7.2: agirlik /2 (0.5/0.3 -> 0.25/0.15)."""
     s = d1h.get("ls_slope")
     if s is None: return 0.0, None
     s = float(s)
-    if s > 0.05:  return +0.5, f"ls_slope={s:+.4f} hizli artiyor (LONG mom)"
-    if s > 0.01:  return +0.3, f"ls_slope={s:+.4f} artiyor"
-    if s < -0.05: return -0.5, f"ls_slope={s:+.4f} hizli azaliyor (SHORT mom)"
-    if s < -0.01: return -0.3, f"ls_slope={s:+.4f} azaliyor"
+    if s > 0.05:  return +0.25, f"ls_slope={s:+.4f} hizli artiyor (LONG mom)"
+    if s > 0.01:  return +0.15, f"ls_slope={s:+.4f} artiyor"
+    if s < -0.05: return -0.25, f"ls_slope={s:+.4f} hizli azaliyor (SHORT mom)"
+    if s < -0.01: return -0.15, f"ls_slope={s:+.4f} azaliyor"
     return 0.0, None
 
 
 def score_oi_momentum(d1h, candles):
+    """V7.2: agirlik /2 (1.0/0.5 -> 0.5/0.25)."""
     delta = d1h.get("oi_delta")
     if delta is None: return 0.0, None
     delta = float(delta)
@@ -280,14 +297,14 @@ def score_oi_momentum(d1h, candles):
     sc = apr < -FUND_WEAK   # short crowded
     lc = apr > FUND_WEAK    # long crowded
 
-    if pu and delta > 0:    return +1.0, f"OI+ p+ yeni LONG akisi"
-    if (not pu) and delta < 0: return +1.0, f"OI- p- SHORT zayifliyor"
+    if pu and delta > 0:    return +0.5, f"OI+ p+ yeni LONG akisi"
+    if (not pu) and delta < 0: return +0.5, f"OI- p- SHORT zayifliyor"
     if pu and delta < 0:
-        if sc: return +0.5, f"OI- p+ + SHORT crowded = squeeze devam"
-        return -0.5, f"OI- p+ short cover fade (SHORT)"
+        if sc: return +0.25, f"OI- p+ + SHORT crowded = squeeze devam"
+        return -0.25, f"OI- p+ short cover fade (SHORT)"
     if (not pu) and delta > 0:
-        if lc: return -0.5, f"OI+ p- + LONG crowded = stop hunt"
-        return -0.5, f"OI+ p- yeni SHORT"
+        if lc: return -0.25, f"OI+ p- + LONG crowded = stop hunt"
+        return -0.25, f"OI+ p- yeni SHORT"
     return 0.0, None
 
 
@@ -313,7 +330,7 @@ def empirik_bonus(whale, ls, depl):
 def main():
     print()
     print("=" * 76)
-    print("  LEADING KARAR v7.1  -  hazirlanyor...")
+    print("  LEADING KARAR v7.2  -  hazirlanyor...")
     print("=" * 76)
 
     rj, age_min = ensure_fresh_data()
@@ -341,7 +358,7 @@ def main():
     bar = "=" * 76
     print()
     print(bar)
-    print(f"  LEADING KARAR v7.1  -  ${price:,.0f}")
+    print(f"  LEADING KARAR v7.2  -  ${price:,.0f}")
     print(f"  LONG-ONLY 2. GORUS  |  Esik: LONG +{KARAR_ESIK_LONG} (Notion n=35 backtest)")
     print(f"  SHORT icin: bu script kullanma -> karar_motoru + entry_trigger")
     print(bar)
