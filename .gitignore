@@ -1,0 +1,22 @@
+# snapshot_arsiv.py'in olusturdugu klasor — repo'ya yuklemiyoruz
+# (~3MB/gun buyuyor, runtime data)
+snapshots/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Yedekler
+*.bak
+*.bak_*
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
