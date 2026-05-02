@@ -1,7 +1,20 @@
 #!/usr/bin/env python3
 """
-leading_karar.py  v7.2  -  Tier 3 agirligi yarilandi (Eren talep)
+leading_karar.py  v7.2 final  -  TEK TUS, TUM PIPELINE, LONG-ONLY KARAR
 ========================================================================
+
+KULLANIM (Pydroid):
+  python3 leading_karar.py  ▶️
+  -> auto_compact_fixed.py CALISTIRILIR (auto_fetch + run_updater + yon_41 +
+     karar_motoru hepsi tetiklenir)
+  -> r_update.json olusur/guncellenir
+  -> leading_karar kendi mantigiyla LONG karar uretir
+  -> 3 cikti: ESKI sistem (karar_motoru), YENI sistem (leading_karar),
+     karsilastirma yapabilirsin
+
+ORCHESTRATOR PRIORITY:
+  1. auto_compact_fixed.py varsa o calisir (tum pipeline)
+  2. Yoksa auto_fetch.py fallback (sadece veri ceker)
 
 V7.2 DEGISIKLIK (May 2 — Eren reconstruction case sonrasi):
   - Tier 3 (DIVERGENCE/MOMENTUM) agirliklari /2:
@@ -113,22 +126,38 @@ def find_r_update():
     return existing[0]
 
 
-def find_auto_fetch():
-    """auto_fetch.py'yi bul."""
-    candidates = [
-        Path(__file__).parent / "auto_fetch.py",
-        Path.cwd() / "auto_fetch.py",
-        Path("/storage/emulated/0/Download/auto_fetch.py"),
-        Path("/storage/emulated/0/Downloads/auto_fetch.py"),
+def find_orchestrator():
+    """Veri tetikleyici bul. Oncelik: auto_compact_fixed.py
+    (icinde auto_fetch + run_updater + karar_motoru tetiklenir).
+    Yoksa auto_fetch.py fallback (sadece veri ceker, karar_motoru calistirmaz)."""
+    base_dirs = [
+        Path(__file__).parent,
+        Path.cwd(),
+        Path("/storage/emulated/0/Download"),
+        Path("/storage/emulated/0/Downloads"),
     ]
-    for p in candidates:
-        if p.is_file():
-            return p
-    return None
+    # Oncelik: auto_compact_fixed (tum pipeline)
+    for d in base_dirs:
+        ac = d / "auto_compact_fixed.py"
+        if ac.is_file():
+            return ac, "auto_compact_fixed"
+    # Fallback: auto_fetch (sadece veri)
+    for d in base_dirs:
+        af = d / "auto_fetch.py"
+        if af.is_file():
+            return af, "auto_fetch"
+    return None, None
+
+
+def find_auto_fetch():
+    """Geriye donuk uyumluluk icin -- find_orchestrator kullanilir."""
+    return find_orchestrator()[0]
 
 
 def ensure_fresh_data():
-    """r_update.json yoksa veya cok eski ise auto_fetch.py calistir.
+    """r_update.json yoksa veya cok eski ise orchestrator'i calistir.
+    Orchestrator = auto_compact_fixed.py (tercih) veya auto_fetch.py (fallback).
+
     Return: (path, age_min) veya (None, None) hata."""
     rj = find_r_update()
     age_min = None
@@ -140,27 +169,28 @@ def ensure_fresh_data():
     if not AUTO_FETCH_ENABLED:
         return rj, age_min
 
-    af = find_auto_fetch()
-    if not af:
+    orch, kind = find_orchestrator()
+    if not orch:
         if rj:
-            print(f"  ! auto_fetch.py bulunamadi, mevcut eski r_update.json kullaniliyor")
+            print(f"  ! orchestrator bulunamadi (auto_compact_fixed.py / auto_fetch.py)")
         return rj, age_min
 
-    print(f"  >>> Veri taze degil ({'eski' if rj else 'yok'}), auto_fetch.py calistiriliyor...")
-    print(f"  >>> {af}")
+    label = "auto_compact_fixed (auto_fetch + run_updater + karar_motoru)" if kind == "auto_compact_fixed" else "auto_fetch"
+    print(f"  >>> Veri taze degil ({'eski' if rj else 'yok'}), {label} calistiriliyor...")
+    print(f"  >>> {orch}")
     print()
     try:
         result = subprocess.run(
-            [sys.executable, str(af)],
-            cwd=str(af.parent),
-            timeout=180,
+            [sys.executable, str(orch)],
+            cwd=str(orch.parent),
+            timeout=300,  # auto_compact_fixed daha uzun surebilir
         )
         if result.returncode != 0:
-            print(f"  ! auto_fetch.py exit code {result.returncode}")
+            print(f"  ! {kind} exit code {result.returncode}")
     except subprocess.TimeoutExpired:
-        print(f"  ! auto_fetch.py timeout (3 dk)")
+        print(f"  ! {kind} timeout (5 dk)")
     except Exception as e:
-        print(f"  ! auto_fetch.py hatasi: {e}")
+        print(f"  ! {kind} hatasi: {e}")
 
     # Tekrar dene
     rj = find_r_update()
