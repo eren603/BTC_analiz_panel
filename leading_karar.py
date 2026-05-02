@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
-leading_karar.py  v7  -  LONG-ONLY 2. GORUS (Notion backtest kalibre)
+leading_karar.py  v7.1  -  LONG-ONLY + OTOMATIK auto_fetch
 ========================================================================
+
+V7.1 DEGISIKLIK (May 2 — Eren talep):
+  - TEK TUS: r_update.json yoksa veya 5 dk'dan eski ise otomatik
+    auto_fetch.py calistirir. Kullanici tek dosyaya basar, gerisi otomatik.
 
 V7 DEGISIKLIK (May 2 — Eren karari):
   - SHORT karar TAMAMEN KALDIRILDI. Notion P79: LONG %95, SHORT %67.
@@ -53,9 +57,14 @@ CVD divergence ve slope analizleri eklendi.
 """
 
 import json
+import subprocess
 import sys
 import time
 from pathlib import Path
+
+# === Auto-fetch ayarlari ===
+AUTO_FETCH_ENABLED = True
+AUTO_FETCH_MAX_AGE_MIN = 5  # bu dakikadan eski veride otomatik yeniler
 
 
 # === Esikler (kalibre DEGIL) ===
@@ -87,6 +96,63 @@ def find_r_update():
         return None
     existing.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return existing[0]
+
+
+def find_auto_fetch():
+    """auto_fetch.py'yi bul."""
+    candidates = [
+        Path(__file__).parent / "auto_fetch.py",
+        Path.cwd() / "auto_fetch.py",
+        Path("/storage/emulated/0/Download/auto_fetch.py"),
+        Path("/storage/emulated/0/Downloads/auto_fetch.py"),
+    ]
+    for p in candidates:
+        if p.is_file():
+            return p
+    return None
+
+
+def ensure_fresh_data():
+    """r_update.json yoksa veya cok eski ise auto_fetch.py calistir.
+    Return: (path, age_min) veya (None, None) hata."""
+    rj = find_r_update()
+    age_min = None
+    if rj:
+        age_min = (time.time() - rj.stat().st_mtime) / 60
+        if age_min <= AUTO_FETCH_MAX_AGE_MIN:
+            return rj, age_min  # taze, dokunma
+
+    if not AUTO_FETCH_ENABLED:
+        return rj, age_min
+
+    af = find_auto_fetch()
+    if not af:
+        if rj:
+            print(f"  ! auto_fetch.py bulunamadi, mevcut eski r_update.json kullaniliyor")
+        return rj, age_min
+
+    print(f"  >>> Veri taze degil ({'eski' if rj else 'yok'}), auto_fetch.py calistiriliyor...")
+    print(f"  >>> {af}")
+    print()
+    try:
+        result = subprocess.run(
+            [sys.executable, str(af)],
+            cwd=str(af.parent),
+            timeout=180,
+        )
+        if result.returncode != 0:
+            print(f"  ! auto_fetch.py exit code {result.returncode}")
+    except subprocess.TimeoutExpired:
+        print(f"  ! auto_fetch.py timeout (3 dk)")
+    except Exception as e:
+        print(f"  ! auto_fetch.py hatasi: {e}")
+
+    # Tekrar dene
+    rj = find_r_update()
+    if rj:
+        age_min = (time.time() - rj.stat().st_mtime) / 60
+    print()
+    return rj, age_min
 
 
 # ============================================================
@@ -245,12 +311,17 @@ def empirik_bonus(whale, ls, depl):
 # ============================================================
 
 def main():
-    rj = find_r_update()
+    print()
+    print("=" * 76)
+    print("  LEADING KARAR v7.1  -  hazirlanyor...")
+    print("=" * 76)
+
+    rj, age_min = ensure_fresh_data()
     if not rj:
-        print("HATA: r_update.json yok. Once auto_fetch.py / auto_compact_fixed.py")
+        print("HATA: r_update.json yok ve auto_fetch.py calistirilamadi.")
+        print("Manuel: python3 auto_fetch.py")
         return 1
 
-    age_min = (time.time() - rj.stat().st_mtime) / 60
     age_tag = (f"{age_min:.1f} dk -- TAZE" if age_min < 5
                else f"{age_min:.0f} dk -- eski" if age_min < 30
                else f"{age_min:.0f} dk -- COK ESKI")
@@ -270,7 +341,7 @@ def main():
     bar = "=" * 76
     print()
     print(bar)
-    print(f"  LEADING KARAR v7  -  ${price:,.0f}")
+    print(f"  LEADING KARAR v7.1  -  ${price:,.0f}")
     print(f"  LONG-ONLY 2. GORUS  |  Esik: LONG +{KARAR_ESIK_LONG} (Notion n=35 backtest)")
     print(f"  SHORT icin: bu script kullanma -> karar_motoru + entry_trigger")
     print(bar)
