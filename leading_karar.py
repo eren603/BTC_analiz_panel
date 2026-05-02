@@ -1,30 +1,37 @@
 #!/usr/bin/env python3
 """
-leading_karar.py  v3  -  EMPIRIK KALIBRE + LIVE OVERLAY = TEK KARAR
-====================================================================
+leading_karar.py  v4  -  TEK FINAL KARAR (Notion + Live + Overlay-only)
+========================================================================
 
-KAYNAK: Notion Runs database (R2-R42, n=35 kapali run).
-Kalibrasyon CSV (deplasman_20260430_014550.csv) uzerinden test edildi.
+KAYNAK:
+  Empirik kalibre = Notion Runs (R2-R42, n=35 kapali, CSV backtest)
+  Live veri      = r_update.json (anlik depth, CVD, funding, OI)
 
-EMPIRIK KURALLAR (kanitlanmis, % gercek backtest):
-  R1: LS_1h > 1.50                          -> LONG  86% (n=7)
-  R2: depl_4h<-1.0 AND LS_1h>1.0            -> LONG  83% (n=6)
-  R3: whale>1.0 AND LS_1h>1.0               -> LONG  80% (n=10)
-  R4: LS_1h > 1.20                          -> LONG  73% (n=11)
-  R5: whale > 1.05                          -> LONG  100% (n=3, az ornek)
-  R6: hicbiri yok                           -> BEKLE veya overlay'a bak
+KARAR HIYERARSISI (yukaridan asagiya):
+  1) Empirik kural fired + overlay 2+/4 ayni yon  -> GIR (YUKSEK guven)
+  2) Empirik kural fired + overlay split          -> GIR (ORTA, kucuk boyut)
+  3) Empirik kural fired + overlay 3+ ters        -> BEKLE (celiski)
+  4) Empirik YOK   + overlay 2+/4 LONG, <=1 SHORT -> DIKKATLI LONG  (V4 YENI)
+  5) Empirik YOK   + overlay 3+/4 SHORT, <=1 LONG -> DIKKATLI SHORT (kati)
+  6) Diger                                          -> BEKLE
 
-SHORT KURALI YOK: Notion verisinde SHORT zayif (P79: %67 vs %95 LONG).
-SHORT acmak icin: live overlay 3+/4 SHORT der ise DIKKATLI olarak isaretler.
-Yoksa SHORT acmaktan kacin (data-driven).
+V4 YENI KURAL (Eren gozlemi May 2):
+  Empirik kural tetiklenmedigi durumda overlay 2 LONG + 1 SHORT vardi,
+  fiyat LONG yonunde gitti. Eski v3'te bu durum BEKLE diyordu — kayip firsat.
+  V4'te bu kapsam icin DIKKATLI LONG etiketi (empirik destek yok, overlay onayli).
 
-LIVE OVERLAY (r_update.json):
-  - depth_imbalance, CVD 5m, funding (price-aware), OI delta
-  - Empirik karari TEYIT eder ya da CELER (uyari)
+SHORT POLITIKASI (Notion P79 dersi):
+  SHORT yapisal zayif (%67 vs %95 LONG). Bu yuzden:
+    - Empirik SHORT kurali YOK
+    - Overlay'dan tek SHORT cikis: 3+/4 SHORT + <=1 LONG (LONG'tan kati esik)
+    - DIKKATLI etiketli (kucuk boyut + siki SL zorunlu)
 
-KULLANIM:
-  python3 leading_karar.py
-  (auto_fetch.py / auto_compact_fixed.py once calismali)
+EMPIRIK KURALLAR (Notion n=35 backtest):
+  R1: LS_1h > 1.50              -> LONG  86% (n=7)
+  R2: depl<-1.0 AND LS>1.0      -> LONG  83% (n=6)
+  R3: whale>1.0 AND LS>1.0      -> LONG  80% (n=10)
+  R4: LS_1h > 1.20              -> LONG  73% (n=11)
+  R5: whale > 1.05              -> LONG 100% (n=3, az ornek)
 """
 
 import json
@@ -32,127 +39,164 @@ import sys
 from pathlib import Path
 
 
-# === Empirik esikler (n=35 backtest, KALIBRE) ===
+# === Empirik (kalibre, Notion n=35) ===
 LS_STRONG_LONG    = 1.50
 LS_LONG           = 1.20
-WHALE_STRONG_LONG = 1.05
 WHALE_LONG        = 1.00
+WHALE_STRONG_LONG = 1.05
 DEPL_DIP_THR      = -1.0
 
-# === Live overlay esikleri (kalibre DEGIL) ===
-DEPTH_LONG_THR    = 1.20
-DEPTH_LONG_STRONG = 2.00
-DEPTH_SHORT_THR   = 0.80
+# === Live overlay (kalibre DEGIL, ilk tahmin) ===
+DEPTH_LONG_THR     = 1.20
+DEPTH_LONG_STRONG  = 2.00
+DEPTH_SHORT_THR    = 0.80
 DEPTH_SHORT_STRONG = 0.50
-CVD_THR_WEAK      = 100_000
-CVD_THR_STRONG    = 500_000
-FUNDING_EXTREME   = 5.0
-FUNDING_WEAK      = 1.5
-OI_THR            = 100
+CVD_THR_WEAK   = 100_000
+CVD_THR_STRONG = 500_000
+FUNDING_EXTREME = 5.0
+FUNDING_WEAK    = 1.5
+OI_THR          = 100
 
 
 def find_r_update():
-    candidates = [
+    for p in [
         Path(__file__).parent / "r_update.json",
         Path.cwd() / "r_update.json",
         Path("/storage/emulated/0/Download/r_update.json"),
         Path("/storage/emulated/0/Downloads/r_update.json"),
-    ]
-    for p in candidates:
+    ]:
         if p.is_file():
             return p
     return None
 
 
 # ============================================================
-#  EMPIRIK KARAR — Notion verisi, kanitlanmis
+#  EMPIRIK KARAR
 # ============================================================
 
 def empirik_karar(whale, ls, depl):
-    """Notion'da n=35 backtest'le dogrulanmis kurallar.
-    Returns: (yon, dogruluk_pct, n, kural_adi) veya (None, 0, 0, sebep)
-    """
+    """Notion n=35 backtest'le dogrulanmis kurallar."""
     if ls is not None and ls > LS_STRONG_LONG:
         return "LONG", 86, 7, "R1: LS>1.50"
     if ls is not None and depl is not None and depl < DEPL_DIP_THR and ls > 1.0:
-        return "LONG", 83, 6, "R2: depl<-1.0 + LS>1.0 (dip toplama)"
+        return "LONG", 83, 6, "R2: depl<-1.0 + LS>1.0"
     if whale is not None and ls is not None and whale > WHALE_LONG and ls > 1.0:
         return "LONG", 80, 10, "R3: whale>1.0 + LS>1.0"
     if ls is not None and ls > LS_LONG:
         return "LONG", 73, 11, "R4: LS>1.20"
     if whale is not None and whale > WHALE_STRONG_LONG:
-        return "LONG", 100, 3, "R5: whale>1.05 (n=3 az ornek)"
-    return None, 0, 0, "hicbir empirik kural tetiklenmedi"
+        return "LONG", 100, 3, "R5: whale>1.05 (n az)"
+    return None, 0, 0, "kural yok"
 
 
 # ============================================================
 #  LIVE OVERLAY
 # ============================================================
 
-def overlay_depth(d1h):
-    val = float(d1h.get("depth_imbalance", 1.0))
-    if val >= DEPTH_LONG_STRONG: return val, "LONG", "GUCLU"
-    if val >= DEPTH_LONG_THR:    return val, "LONG", "ZAYIF"
-    if val <= DEPTH_SHORT_STRONG: return val, "SHORT", "GUCLU"
-    if val <= DEPTH_SHORT_THR:   return val, "SHORT", "ZAYIF"
-    return val, "NOTR", "—"
+def ov_depth(d1h):
+    v = float(d1h.get("depth_imbalance", 1.0))
+    if v >= DEPTH_LONG_STRONG:  return v, "LONG", "GUCLU"
+    if v >= DEPTH_LONG_THR:     return v, "LONG", "ZAYIF"
+    if v <= DEPTH_SHORT_STRONG: return v, "SHORT", "GUCLU"
+    if v <= DEPTH_SHORT_THR:    return v, "SHORT", "ZAYIF"
+    return v, "NOTR", "—"
 
 
-def overlay_cvd(d5m):
-    val = float(d5m.get("futures_cvd", 0))
-    if val >= CVD_THR_STRONG:  return val, "LONG", "GUCLU"
-    if val >= CVD_THR_WEAK:    return val, "LONG", "ZAYIF"
-    if val <= -CVD_THR_STRONG: return val, "SHORT", "GUCLU"
-    if val <= -CVD_THR_WEAK:   return val, "SHORT", "ZAYIF"
-    return val, "NOTR", "—"
+def ov_cvd(d5m):
+    v = float(d5m.get("futures_cvd", 0))
+    if v >= CVD_THR_STRONG:  return v, "LONG", "GUCLU"
+    if v >= CVD_THR_WEAK:    return v, "LONG", "ZAYIF"
+    if v <= -CVD_THR_STRONG: return v, "SHORT", "GUCLU"
+    if v <= -CVD_THR_WEAK:   return v, "SHORT", "ZAYIF"
+    return v, "NOTR", "—"
 
 
-def overlay_funding(d1h, candles):
-    """Price-aware funding (v2 dersinden)."""
+def ov_funding(d1h, candles):
+    """Price-aware funding (R41 dersi)."""
     fr = d1h.get("funding_rate")
     if fr is None: return None, "NO_DATA", "—", None
     apr = float(fr) * 3 * 365 * 100
     if abs(apr) < FUNDING_WEAK:
         return apr, "NOTR", "—", None
     c5 = (candles or {}).get("5m", {}).get("curr") or {}
-    price_up = None
+    pu = None
     if c5:
         o = float(c5.get("open", 0)); c = float(c5.get("close", 0))
-        if o > 0: price_up = c > o
-    is_extreme = abs(apr) >= FUNDING_EXTREME
-    guc = "GUCLU" if is_extreme else "ZAYIF"
-    if price_up is None:
-        return apr, "NOTR", "WARNING", "price yon yok"
-    if apr < 0:
-        return (apr, "LONG" if price_up else "SHORT", guc,
-                "SHORT crowding+p+" if price_up else "SHORT pro-trend")
-    return (apr, "LONG" if price_up else "SHORT", guc,
-            "LONG momentum" if price_up else "LONG distribution")
+        if o > 0: pu = c > o
+    g = "GUCLU" if abs(apr) >= FUNDING_EXTREME else "ZAYIF"
+    if pu is None: return apr, "NOTR", "WARNING", "price yon yok"
+    if apr < 0:  # SHORT crowded
+        return (apr, "LONG" if pu else "SHORT", g,
+                "squeeze" if pu else "pro-trend")
+    else:        # LONG crowded
+        return (apr, "LONG" if pu else "SHORT", g,
+                "momentum" if pu else "distribution")
 
 
-def overlay_oi(d1h, candles):
-    delta = d1h.get("oi_delta")
-    if delta is None: return None, "NO_DATA", "—"
-    delta = float(delta)
-    if abs(delta) < OI_THR: return delta, "NOTR", "—"
+def ov_oi(d1h, candles):
+    d = d1h.get("oi_delta")
+    if d is None: return None, "NO_DATA", "—"
+    d = float(d)
+    if abs(d) < OI_THR: return d, "NOTR", "—"
     c5 = (candles or {}).get("5m", {}).get("curr") or {}
-    if not c5: return delta, "NOTR", "—"
+    if not c5: return d, "NOTR", "—"
     o = float(c5.get("open", 0)); c = float(c5.get("close", 0))
-    if o == 0: return delta, "NOTR", "—"
-    price_up = c > o
+    if o == 0: return d, "NOTR", "—"
+    pu = c > o
     fr = d1h.get("funding_rate")
     apr = (fr * 3 * 365 * 100) if fr is not None else 0.0
-    short_crowded = apr < -FUNDING_WEAK
-    long_crowded = apr > FUNDING_WEAK
-    if price_up and delta > 0:    return delta, "LONG", "yeni LONG"
-    if (not price_up) and delta < 0: return delta, "LONG", "SHORT zayifliyor"
-    if price_up and delta < 0:
-        if short_crowded: return delta, "LONG", "squeeze devam"
-        return delta, "SHORT", "short cover fade"
-    if (not price_up) and delta > 0:
-        if long_crowded: return delta, "SHORT", "stop hunt"
-        return delta, "SHORT", "SHORT yeni"
-    return delta, "NOTR", "—"
+    if pu and d > 0:    return d, "LONG", "yeni LONG"
+    if (not pu) and d < 0: return d, "LONG", "SHORT zayifliyor"
+    if pu and d < 0:
+        if apr < -FUNDING_WEAK: return d, "LONG", "squeeze devam"
+        return d, "SHORT", "short cover fade"
+    if (not pu) and d > 0:
+        if apr > FUNDING_WEAK: return d, "SHORT", "stop hunt"
+        return d, "SHORT", "SHORT yeni"
+    return d, "NOTR", "—"
+
+
+# ============================================================
+#  KARAR HIYERARSISI
+# ============================================================
+
+def final_karar(emp, ov_long, ov_short, g_long, g_short):
+    yon_emp, pct, n, kural = emp
+
+    # Seviye 1, 2, 3: empirik fired
+    if yon_emp == "LONG":
+        if ov_long >= 2 and ov_short <= 1:
+            return ("GIR LONG", "YUKSEK",
+                    f"empirik %{pct} ({kural}) + overlay {ov_long}/4 LONG",
+                    "NORMAL")
+        if ov_short >= 3:
+            return ("BEKLE", "CELISKI",
+                    f"empirik LONG ama overlay {ov_short}/4 SHORT — sample bias riski",
+                    "—")
+        return ("GIR LONG", "ORTA",
+                f"empirik %{pct} ({kural}), overlay split (L={ov_long}/S={ov_short})",
+                "KUCUK")
+
+    # Seviye 4: empirik YOK + overlay LONG cogunluk (V4 YENI)
+    if ov_long >= 2 and ov_short <= 1:
+        kalite = "GUCLU" if g_long >= 2 else "ZAYIF"
+        etiket = "ORTA" if g_long >= 2 else "DUSUK"
+        return ("DIKKATLI LONG", etiket,
+                f"empirik yok, overlay {ov_long}/4 LONG ({kalite}), SHORT={ov_short}",
+                "KUCUK")
+
+    # Seviye 5: empirik YOK + overlay 3+ SHORT (kati esik, P79)
+    if ov_short >= 3 and ov_long <= 1:
+        kalite = "GUCLU" if g_short >= 2 else "ZAYIF"
+        return ("DIKKATLI SHORT", "DUSUK",
+                f"empirik yok, overlay {ov_short}/4 SHORT ({kalite}); "
+                f"P79: SHORT historical %67",
+                "COK KUCUK + siki SL")
+
+    # Seviye 6: BEKLE
+    return ("BEKLE", "—",
+            f"empirik yok, overlay yetersiz/celisik (L={ov_long}/S={ov_short})",
+            "—")
 
 
 # ============================================================
@@ -183,94 +227,77 @@ def main():
     bar = "=" * 76
     print()
     print(bar)
-    print(f"  LEADING KARAR v3  -  ${price:,.0f}")
-    print(f"  Empirik kalibre (Notion n=35) + live overlay")
+    print(f"  LEADING KARAR v4  -  ${price:,.0f}")
+    print(f"  Notion empirik (n=35) + live overlay + V4 overlay-only kural")
     print(bar)
     print()
 
     # 1) Empirik
-    print("  1) EMPIRIK KURALLAR (Notion n=35 backtest)")
+    print("  1) EMPIRIK (Notion n=35)")
     print("  " + "-" * 72)
     if depl is not None:
-        print(f"  Veri:  whale={whale}  LS_1h={ls}  depl_4h={depl:+.2f}%")
+        print(f"  whale={whale}  LS_1h={ls}  depl_4h={depl:+.2f}%")
     else:
-        print(f"  Veri:  whale={whale}  LS_1h={ls}  depl=YOK")
-    print()
-    yon_emp, guc_pct, n, kural = empirik_karar(whale, ls, depl)
+        print(f"  whale={whale}  LS_1h={ls}  depl=YOK")
+    emp = empirik_karar(whale, ls, depl)
+    yon_emp, pct, n, kural = emp
     if yon_emp:
-        print(f"  >>> Tetiklenen: {kural}")
-        print(f"      Yon: {yon_emp}, gercekleme: %{guc_pct} (n={n})")
+        print(f"  >>> {kural} -> {yon_emp} (%{pct} historic, n={n})")
     else:
         print(f"  >>> {kural}")
 
     # 2) Overlay
     print()
-    print("  2) LIVE OVERLAY (r_update.json anlik)")
+    print("  2) LIVE OVERLAY")
     print("  " + "-" * 72)
-    d_v, d_y, d_g = overlay_depth(d1h)
-    c_v, c_y, c_g = overlay_cvd(d5m)
-    f_v, f_y, f_g, f_d = overlay_funding(d1h, candles)
-    o_v, o_y, o_d = overlay_oi(d1h, candles)
+    d_v, d_y, d_g = ov_depth(d1h)
+    c_v, c_y, c_g = ov_cvd(d5m)
+    f_v, f_y, f_g, f_d = ov_funding(d1h, candles)
+    o_v, o_y, o_d = ov_oi(d1h, candles)
+
     def mk(y):
         return {"LONG":"[+]","SHORT":"[-]","NOTR":"[ ]","NO_DATA":"[?]"}.get(y,"[?]")
-    print(f"  {mk(d_y)} depth     -> {d_y:<6} ({d_g:<6})  {d_v:.2f}")
-    print(f"  {mk(c_y)} CVD 5m    -> {c_y:<6} ({c_g:<6})  {c_v:+,.0f}")
-    if f_v is not None:
-        f_extra = f" ({f_d})" if f_d else ""
-        print(f"  {mk(f_y)} funding   -> {f_y:<6} ({f_g:<6})  {f_v:+.1f}% APR{f_extra}")
-    else:
-        print(f"  {mk(f_y)} funding   -> NO_DATA")
-    if o_v is not None:
-        print(f"  {mk(o_y)} OI mom.   -> {o_y:<6} ({o_d})  oi={o_v:+.0f}")
-    else:
-        print(f"  {mk(o_y)} OI mom.   -> NO_DATA")
 
-    overlay_long  = sum(1 for y in [d_y, c_y, f_y, o_y] if y == "LONG")
-    overlay_short = sum(1 for y in [d_y, c_y, f_y, o_y] if y == "SHORT")
+    print(f"  {mk(d_y)} depth   -> {d_y:<5} ({d_g:<6})  {d_v:.2f}")
+    print(f"  {mk(c_y)} CVD 5m  -> {c_y:<5} ({c_g:<6})  {c_v:+,.0f}")
+    if f_v is not None:
+        ext = f" ({f_d})" if f_d else ""
+        print(f"  {mk(f_y)} funding -> {f_y:<5} ({f_g:<6})  {f_v:+.1f}% APR{ext}")
+    else:
+        print(f"  {mk(f_y)} funding -> NO_DATA")
+    if o_v is not None:
+        print(f"  {mk(o_y)} OI mom. -> {o_y:<5} ({o_d})  oi={o_v:+.0f}")
+    else:
+        print(f"  {mk(o_y)} OI mom. -> NO_DATA")
+
+    sigs = [(d_y, d_g), (c_y, c_g), (f_y, f_g), (o_y, "—")]
+    ov_long  = sum(1 for y, g in sigs if y == "LONG")
+    ov_short = sum(1 for y, g in sigs if y == "SHORT")
+    g_long  = sum(1 for y, g in sigs if y == "LONG"  and g == "GUCLU")
+    g_short = sum(1 for y, g in sigs if y == "SHORT" and g == "GUCLU")
     print()
-    print(f"  Overlay sayim: LONG={overlay_long}  SHORT={overlay_short}")
+    print(f"  Sayim: LONG={ov_long} (GUCLU={g_long})  "
+          f"SHORT={ov_short} (GUCLU={g_short})")
 
     # 3) Final
     print()
     print(bar)
     print("  >>> FINAL KARAR")
     print(bar)
-
-    if yon_emp == "LONG":
-        if overlay_long >= 2 and overlay_short <= 1:
-            print(f"  GIR LONG  (empirik %{guc_pct} + overlay {overlay_long}/4 LONG)")
-            print(f"  Kural    : {kural}")
-            print(f"  Guven    : YUKSEK")
-        elif overlay_short >= 3:
-            print(f"  BEKLE  (CELISKI: empirik LONG, overlay {overlay_short}/4 SHORT)")
-            print(f"  Empirik  : {kural} (%{guc_pct} historical)")
-            print(f"  Live     : agir basiyor SHORT — sample LONG-bias'a guvenme")
-        else:
-            print(f"  GIR LONG  (empirik %{guc_pct}, overlay karisik)")
-            print(f"  Kural    : {kural}")
-            print(f"  Guven    : ORTA — POZISYONU KUCULT")
-            if overlay_short > overlay_long:
-                print(f"  UYARI    : overlay SHORT={overlay_short} > LONG={overlay_long}")
-    else:
-        if overlay_short >= 3 and overlay_long <= 1:
-            print(f"  DIKKATLI SHORT  (empirik YOK, overlay {overlay_short}/4 SHORT)")
-            print(f"  UYARI: Notion'da SHORT yapisal zayif (P79: %67 vs %95 LONG)")
-            print(f"  Acarsan: KUCUK BOYUT + siki SL (ATR x 1.0)")
-        elif overlay_long >= 3 and overlay_short <= 1:
-            print(f"  DIKKATLI LONG  (empirik YOK, overlay {overlay_long}/4 LONG)")
-            print(f"  Empirik destek yok — KUCUK BOYUT")
-        else:
-            print(f"  BEKLE")
-            print(f"  Sebep: empirik kural yok, overlay yetersiz/celisik")
+    karar, etiket, sebep, boyut = final_karar(emp, ov_long, ov_short, g_long, g_short)
+    print(f"  {karar}  ({etiket})")
+    print(f"  Sebep : {sebep}")
+    if boyut != "—":
+        print(f"  Boyut : {boyut}")
 
     print()
     print("  DURUSTLUK:")
-    print(f"    - Empirik baseline: %68.6 UP (sample LONG-bias, R2-R42 n=35)")
-    print(f"    - SHORT kurali yok: Notion verisinde SHORT iyi sinyal vermiyor")
-    print(f"    - Live overlay esikleri kalibre DEGIL — ilk tahmin")
-    no_data = [y for y in [d_y, c_y, f_y, o_y] if y == "NO_DATA"]
-    if no_data:
-        print(f"    - {len(no_data)} live sinyalde veri yok")
+    print(f"    - Empirik baseline: %68.6 UP (Notion R2-R42 sample LONG-bias)")
+    print(f"    - V4 yeni kural: empirik yok ama overlay 2+ LONG -> DIKKATLI LONG")
+    print(f"    - SHORT esigi 3+ (P79: SHORT %67 < LONG %95)")
+    no_d = sum(1 for y, _ in sigs if y == "NO_DATA")
+    if no_d:
+        print(f"    - {no_d}/4 overlay sinyalde veri yok")
 
     print()
     print(bar)
