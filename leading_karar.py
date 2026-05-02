@@ -1,71 +1,66 @@
 #!/usr/bin/env python3
 """
-leading_karar.py  v5  -  TEK FINAL KARAR + dosya tarihi kontrolu
+leading_karar.py  v6  -  SAYISAL TEK KARAR (hedge yok)
 ========================================================================
-V5 DEGISIKLIK (May 2 23:30 — Eren bug bildirimi):
-  - find_r_update artik EN YENI mtime'li dosyayi seciyor (eskiden ilk bulduguna donerdi)
-  - /storage/emulated/0/r_update.json path eklendi (root'taki dosya)
-  - Cikti'da hangi dosyayi okudugu + kac dk eski yazar
-  - 30 dk'dan eski ise UYARI (auto_fetch calistir)
 
-KAYNAK:
-  Empirik kalibre = Notion Runs (R2-R42, n=35 kapali, CSV backtest)
-  Live veri      = r_update.json (anlik depth, CVD, funding, OI)
+V6 DEGISIKLIK (May 2 — Eren karari: secenek C):
+  - Hedge dili kaldirildi. "DIKKATLI/ORTA/KUCUK" yok.
+  - SAYISAL puan -10..+10 araligi. Esik +/-6.
+  - 3 tek karar: GIR LONG / BEKLE / GIR SHORT
+  - Yeni sinyaller: CVD divergence, ls_slope, oi_momentum
+  - Boyut puana gore otomatik (manuel etiket yok)
 
-KARAR HIYERARSISI (yukaridan asagiya):
-  1) Empirik kural fired + overlay 2+/4 ayni yon  -> GIR (YUKSEK guven)
-  2) Empirik kural fired + overlay split          -> GIR (ORTA, kucuk boyut)
-  3) Empirik kural fired + overlay 3+ ters        -> BEKLE (celiski)
-  4) Empirik YOK   + overlay 2+/4 LONG, <=1 SHORT -> DIKKATLI LONG  (V4 YENI)
-  5) Empirik YOK   + overlay 3+/4 SHORT, <=1 LONG -> DIKKATLI SHORT (kati)
-  6) Diger                                          -> BEKLE
+PUAN BILESENLERI (her biri -3..+3):
+  Tier 1 LIVE (max ±5):
+    - depth_imbalance (orderbook anlik)         : ±2
+    - CVD 5m taker akis                         : ±2
+    - funding (price-aware)                     : ±1
+  Tier 2 STRUCTURE (max ±3):
+    - LS_1h zone (Notion empirik kalibre)       : -1..+2.5
+    - whale zone (Notion empirik)               : -1..+2
+    - depl_4h zone                              : -1..+1
+  Tier 3 DIVERGENCE (max ±2):
+    - CVD 5m vs 1h zit yon = exhaustion         : ±1.5
+    - ls_slope direction                        : ±0.5
+    - OI momentum + price                       : ±1
+  Tier 4 EMPIRIK BONUS:
+    - Notion R1-R5 fired                        : +1 ek
 
-V4 YENI KURAL (Eren gozlemi May 2):
-  Empirik kural tetiklenmedigi durumda overlay 2 LONG + 1 SHORT vardi,
-  fiyat LONG yonunde gitti. Eski v3'te bu durum BEKLE diyordu — kayip firsat.
-  V4'te bu kapsam icin DIKKATLI LONG etiketi (empirik destek yok, overlay onayli).
+KARAR ESIGI:
+  toplam >= +6.0  ->  GIR LONG
+  toplam <= -6.0  ->  GIR SHORT
+  arasi          ->  BEKLE
 
-SHORT POLITIKASI (Notion P79 dersi):
-  SHORT yapisal zayif (%67 vs %95 LONG). Bu yuzden:
-    - Empirik SHORT kurali YOK
-    - Overlay'dan tek SHORT cikis: 3+/4 SHORT + <=1 LONG (LONG'tan kati esik)
-    - DIKKATLI etiketli (kucuk boyut + siki SL zorunlu)
+BOYUT (otomatik):
+  risk_pct  = abs(skor) / 10 * 2.0  (max %2 bakiye risk)
+  kaldirac  = abs(skor) / 10 * 5.0  (max 5x)
 
-EMPIRIK KURALLAR (Notion n=35 backtest):
-  R1: LS_1h > 1.50              -> LONG  86% (n=7)
-  R2: depl<-1.0 AND LS>1.0      -> LONG  83% (n=6)
-  R3: whale>1.0 AND LS>1.0      -> LONG  80% (n=10)
-  R4: LS_1h > 1.20              -> LONG  73% (n=11)
-  R5: whale > 1.05              -> LONG 100% (n=3, az ornek)
+V5'TEN FARK: hedge yok, sayisal eşik, daha fazla sinyal,
+CVD divergence ve slope analizleri eklendi.
 """
 
 import json
 import sys
+import time
 from pathlib import Path
 
 
-# === Empirik (kalibre, Notion n=35) ===
-LS_STRONG_LONG    = 1.50
-LS_LONG           = 1.20
-WHALE_LONG        = 1.00
-WHALE_STRONG_LONG = 1.05
-DEPL_DIP_THR      = -1.0
+# === Esikler (kalibre DEGIL) ===
+DEPTH_GUCLU_LONG  = 2.0
+DEPTH_LONG        = 1.2
+DEPTH_SHORT       = 0.8
+DEPTH_GUCLU_SHORT = 0.5
+CVD_GUCLU = 500_000
+CVD_HAFIF = 100_000
+FUND_EXTREME = 5.0
+FUND_WEAK    = 1.5
+OI_MIN       = 100
 
-# === Live overlay (kalibre DEGIL, ilk tahmin) ===
-DEPTH_LONG_THR     = 1.20
-DEPTH_LONG_STRONG  = 2.00
-DEPTH_SHORT_THR    = 0.80
-DEPTH_SHORT_STRONG = 0.50
-CVD_THR_WEAK   = 100_000
-CVD_THR_STRONG = 500_000
-FUNDING_EXTREME = 5.0
-FUNDING_WEAK    = 1.5
-OI_THR          = 100
+KARAR_ESIK = 6.0
 
 
 def find_r_update():
-    """En yeni mtime'li r_update.json'u sec.
-    Birden fazla dosya varsa eski olanlari atla."""
+    """En yeni mtime'li r_update.json'u sec."""
     candidates = [
         Path(__file__).parent / "r_update.json",
         Path.cwd() / "r_update.json",
@@ -76,138 +71,159 @@ def find_r_update():
     existing = [p for p in candidates if p.is_file()]
     if not existing:
         return None
-    # En yeni mtime
     existing.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return existing[0]
 
 
 # ============================================================
-#  EMPIRIK KARAR
+#  SCORE FONKSIYONLARI — her biri (puan, aciklama) doner
 # ============================================================
 
-def empirik_karar(whale, ls, depl):
-    """Notion n=35 backtest'le dogrulanmis kurallar."""
-    if ls is not None and ls > LS_STRONG_LONG:
-        return "LONG", 86, 7, "R1: LS>1.50"
-    if ls is not None and depl is not None and depl < DEPL_DIP_THR and ls > 1.0:
-        return "LONG", 83, 6, "R2: depl<-1.0 + LS>1.0"
-    if whale is not None and ls is not None and whale > WHALE_LONG and ls > 1.0:
-        return "LONG", 80, 10, "R3: whale>1.0 + LS>1.0"
-    if ls is not None and ls > LS_LONG:
-        return "LONG", 73, 11, "R4: LS>1.20"
-    if whale is not None and whale > WHALE_STRONG_LONG:
-        return "LONG", 100, 3, "R5: whale>1.05 (n az)"
-    return None, 0, 0, "kural yok"
-
-
-# ============================================================
-#  LIVE OVERLAY
-# ============================================================
-
-def ov_depth(d1h):
+def score_depth(d1h):
     v = float(d1h.get("depth_imbalance", 1.0))
-    if v >= DEPTH_LONG_STRONG:  return v, "LONG", "GUCLU"
-    if v >= DEPTH_LONG_THR:     return v, "LONG", "ZAYIF"
-    if v <= DEPTH_SHORT_STRONG: return v, "SHORT", "GUCLU"
-    if v <= DEPTH_SHORT_THR:    return v, "SHORT", "ZAYIF"
-    return v, "NOTR", "—"
+    if v >= DEPTH_GUCLU_LONG:  return +2.0, f"depth={v:.2f} alici cok GUCLU"
+    if v >= DEPTH_LONG:        return +1.0, f"depth={v:.2f} alici hafif"
+    if v <= DEPTH_GUCLU_SHORT: return -2.0, f"depth={v:.2f} satici cok GUCLU"
+    if v <= DEPTH_SHORT:       return -1.0, f"depth={v:.2f} satici hafif"
+    return 0.0, f"depth={v:.2f} dengeli"
 
 
-def ov_cvd(d5m):
+def score_cvd_5m(d5m):
     v = float(d5m.get("futures_cvd", 0))
-    if v >= CVD_THR_STRONG:  return v, "LONG", "GUCLU"
-    if v >= CVD_THR_WEAK:    return v, "LONG", "ZAYIF"
-    if v <= -CVD_THR_STRONG: return v, "SHORT", "GUCLU"
-    if v <= -CVD_THR_WEAK:   return v, "SHORT", "ZAYIF"
-    return v, "NOTR", "—"
+    if v >= CVD_GUCLU:   return +2.0, f"CVD5m={v:+,.0f} alici GUCLU"
+    if v >= CVD_HAFIF:   return +1.0, f"CVD5m={v:+,.0f} alici hafif"
+    if v <= -CVD_GUCLU:  return -2.0, f"CVD5m={v:+,.0f} satici GUCLU"
+    if v <= -CVD_HAFIF:  return -1.0, f"CVD5m={v:+,.0f} satici hafif"
+    return 0.0, f"CVD5m={v:+,.0f} zayif"
 
 
-def ov_funding(d1h, candles):
-    """Price-aware funding (R41 dersi)."""
+def score_funding(d1h, candles):
+    """Price-aware funding."""
     fr = d1h.get("funding_rate")
-    if fr is None: return None, "NO_DATA", "—", None
+    if fr is None:
+        return 0.0, "funding yok"
     apr = float(fr) * 3 * 365 * 100
-    if abs(apr) < FUNDING_WEAK:
-        return apr, "NOTR", "—", None
+    if abs(apr) < FUND_WEAK:
+        return 0.0, f"funding {apr:+.1f}% dengeli"
+
     c5 = (candles or {}).get("5m", {}).get("curr") or {}
     pu = None
     if c5:
         o = float(c5.get("open", 0)); c = float(c5.get("close", 0))
         if o > 0: pu = c > o
-    g = "GUCLU" if abs(apr) >= FUNDING_EXTREME else "ZAYIF"
-    if pu is None: return apr, "NOTR", "WARNING", "price yon yok"
+    if pu is None:
+        return 0.0, f"funding {apr:+.1f}% (price yon yok)"
+
+    is_ext = abs(apr) >= FUND_EXTREME
+    mult = 1.5 if is_ext else 1.0
+
     if apr < 0:  # SHORT crowded
-        return (apr, "LONG" if pu else "SHORT", g,
-                "squeeze" if pu else "pro-trend")
-    else:        # LONG crowded
-        return (apr, "LONG" if pu else "SHORT", g,
-                "momentum" if pu else "distribution")
+        if pu:  return +mult, f"funding {apr:+.1f}% + p+ = squeeze rally"
+        return -mult, f"funding {apr:+.1f}% + p- = SHORT pro-trend"
+    if pu:    return +mult, f"funding {apr:+.1f}% + p+ = LONG momentum"
+    return -mult, f"funding {apr:+.1f}% + p- = LONG distribution"
 
 
-def ov_oi(d1h, candles):
-    d = d1h.get("oi_delta")
-    if d is None: return None, "NO_DATA", "—"
-    d = float(d)
-    if abs(d) < OI_THR: return d, "NOTR", "—"
+def score_ls_1h(d1h):
+    """Notion empirik kalibre."""
+    ls = d1h.get("taker_ls_ratio")
+    if ls is None: return 0.0, "LS_1h yok"
+    ls = float(ls)
+    if ls > 1.50: return +2.5, f"LS_1h={ls:.3f} > 1.50 (Notion R1: 86% LONG)"
+    if ls > 1.20: return +1.5, f"LS_1h={ls:.3f} > 1.20 (Notion R4: 73% LONG)"
+    if ls > 1.00: return +0.5, f"LS_1h={ls:.3f} > 1.00 LONG hafif"
+    if ls < 0.85: return -1.0, f"LS_1h={ls:.3f} < 0.85 SHORT bias"
+    return 0.0, f"LS_1h={ls:.3f} dengeli"
+
+
+def score_whale(d1h):
+    whale = d1h.get("whale_acct_ls")
+    ls    = d1h.get("taker_ls_ratio")
+    if whale is None: return 0.0, "whale yok"
+    whale = float(whale)
+    if whale > 1.05: return +2.0, f"whale={whale:.3f} > 1.05 (Notion R5: 100% n=3)"
+    if whale > 1.00 and ls is not None and float(ls) > 1.00:
+        return +1.5, f"whale={whale:.3f} + LS>1.0 (Notion R3: 80% LONG)"
+    if whale > 1.00: return +0.5, f"whale={whale:.3f} > 1.00 LONG bias"
+    if whale < 0.85: return -1.0, f"whale={whale:.3f} < 0.85 SHORT bias"
+    return 0.0, f"whale={whale:.3f} dengeli"
+
+
+def score_depl(d4h):
+    p = d4h.get("current_price")
+    ma = d4h.get("ma30")
+    if not (p and ma and ma > 0):
+        return 0.0, None, "depl_4h yok"
+    depl = (float(p) - float(ma)) / float(ma) * 100
+    if depl > 3.0:  return -1.0, depl, f"depl={depl:+.2f}% asiri yukari (mean rev SHORT)"
+    if depl > 0:    return +1.0, depl, f"depl={depl:+.2f}% MA30 ustu LONG yapi"
+    if depl < -1.0: return +0.5, depl, f"depl={depl:+.2f}% dip toplama bolge"
+    return 0.0, depl, f"depl={depl:+.2f}%"
+
+
+def score_divergence(d5m, d1h):
+    """CVD 5m vs 1h zit yön = exhaustion."""
+    c5 = float(d5m.get("futures_cvd", 0))
+    c1 = float(d1h.get("futures_cvd", 0))
+    if abs(c5) < CVD_HAFIF or abs(c1) < CVD_HAFIF:
+        return 0.0, None
+    if c5 > 0 and c1 < 0:
+        return -1.5, f"CVD div: 5m+ vs 1h- = rally exhaustion (SHORT sinyali)"
+    if c5 < 0 and c1 > 0:
+        return +1.5, f"CVD div: 5m- vs 1h+ = dip exhaustion (LONG sinyali)"
+    return 0.0, None
+
+
+def score_ls_slope(d1h):
+    s = d1h.get("ls_slope")
+    if s is None: return 0.0, None
+    s = float(s)
+    if s > 0.05:  return +0.5, f"ls_slope={s:+.4f} hizli artiyor (LONG mom)"
+    if s > 0.01:  return +0.3, f"ls_slope={s:+.4f} artiyor"
+    if s < -0.05: return -0.5, f"ls_slope={s:+.4f} hizli azaliyor (SHORT mom)"
+    if s < -0.01: return -0.3, f"ls_slope={s:+.4f} azaliyor"
+    return 0.0, None
+
+
+def score_oi_momentum(d1h, candles):
+    delta = d1h.get("oi_delta")
+    if delta is None: return 0.0, None
+    delta = float(delta)
+    if abs(delta) < OI_MIN: return 0.0, None
     c5 = (candles or {}).get("5m", {}).get("curr") or {}
-    if not c5: return d, "NOTR", "—"
+    if not c5: return 0.0, None
     o = float(c5.get("open", 0)); c = float(c5.get("close", 0))
-    if o == 0: return d, "NOTR", "—"
+    if o == 0: return 0.0, None
     pu = c > o
     fr = d1h.get("funding_rate")
-    apr = (fr * 3 * 365 * 100) if fr is not None else 0.0
-    if pu and d > 0:    return d, "LONG", "yeni LONG"
-    if (not pu) and d < 0: return d, "LONG", "SHORT zayifliyor"
-    if pu and d < 0:
-        if apr < -FUNDING_WEAK: return d, "LONG", "squeeze devam"
-        return d, "SHORT", "short cover fade"
-    if (not pu) and d > 0:
-        if apr > FUNDING_WEAK: return d, "SHORT", "stop hunt"
-        return d, "SHORT", "SHORT yeni"
-    return d, "NOTR", "—"
+    apr = (float(fr) * 3 * 365 * 100) if fr is not None else 0.0
+    sc = apr < -FUND_WEAK   # short crowded
+    lc = apr > FUND_WEAK    # long crowded
+
+    if pu and delta > 0:    return +1.0, f"OI+ p+ yeni LONG akisi"
+    if (not pu) and delta < 0: return +1.0, f"OI- p- SHORT zayifliyor"
+    if pu and delta < 0:
+        if sc: return +0.5, f"OI- p+ + SHORT crowded = squeeze devam"
+        return -0.5, f"OI- p+ short cover fade (SHORT)"
+    if (not pu) and delta > 0:
+        if lc: return -0.5, f"OI+ p- + LONG crowded = stop hunt"
+        return -0.5, f"OI+ p- yeni SHORT"
+    return 0.0, None
 
 
-# ============================================================
-#  KARAR HIYERARSISI
-# ============================================================
-
-def final_karar(emp, ov_long, ov_short, g_long, g_short):
-    yon_emp, pct, n, kural = emp
-
-    # Seviye 1, 2, 3: empirik fired
-    if yon_emp == "LONG":
-        if ov_long >= 2 and ov_short <= 1:
-            return ("GIR LONG", "YUKSEK",
-                    f"empirik %{pct} ({kural}) + overlay {ov_long}/4 LONG",
-                    "NORMAL")
-        if ov_short >= 3:
-            return ("BEKLE", "CELISKI",
-                    f"empirik LONG ama overlay {ov_short}/4 SHORT — sample bias riski",
-                    "—")
-        return ("GIR LONG", "ORTA",
-                f"empirik %{pct} ({kural}), overlay split (L={ov_long}/S={ov_short})",
-                "KUCUK")
-
-    # Seviye 4: empirik YOK + overlay LONG cogunluk (V4 YENI)
-    if ov_long >= 2 and ov_short <= 1:
-        kalite = "GUCLU" if g_long >= 2 else "ZAYIF"
-        etiket = "ORTA" if g_long >= 2 else "DUSUK"
-        return ("DIKKATLI LONG", etiket,
-                f"empirik yok, overlay {ov_long}/4 LONG ({kalite}), SHORT={ov_short}",
-                "KUCUK")
-
-    # Seviye 5: empirik YOK + overlay 3+ SHORT (kati esik, P79)
-    if ov_short >= 3 and ov_long <= 1:
-        kalite = "GUCLU" if g_short >= 2 else "ZAYIF"
-        return ("DIKKATLI SHORT", "DUSUK",
-                f"empirik yok, overlay {ov_short}/4 SHORT ({kalite}); "
-                f"P79: SHORT historical %67",
-                "COK KUCUK + siki SL")
-
-    # Seviye 6: BEKLE
-    return ("BEKLE", "—",
-            f"empirik yok, overlay yetersiz/celisik (L={ov_long}/S={ov_short})",
-            "—")
+def empirik_bonus(whale, ls, depl):
+    """Notion n=35 R1-R5 kurallari TETIKLENDIYSE bonus."""
+    if ls is not None and ls > 1.50:
+        return +1.0, "R1 fired: LS>1.50 (86%)"
+    if ls is not None and depl is not None and depl < -1.0 and ls > 1.0:
+        return +1.0, "R2 fired: depl<-1.0 + LS>1.0 (83%)"
+    if whale is not None and ls is not None and whale > 1.0 and ls > 1.0:
+        return +1.0, "R3 fired: whale>1.0 + LS>1.0 (80%)"
+    if ls is not None and ls > 1.20:
+        return +1.0, "R4 fired: LS>1.20 (73%)"
+    if whale is not None and whale > 1.05:
+        return +1.0, "R5 fired: whale>1.05 (100%, n=3)"
+    return 0.0, None
 
 
 # ============================================================
@@ -215,24 +231,15 @@ def final_karar(emp, ov_long, ov_short, g_long, g_short):
 # ============================================================
 
 def main():
-    import time
     rj = find_r_update()
     if not rj:
         print("HATA: r_update.json yok. Once auto_fetch.py / auto_compact_fixed.py")
-        print("Aranan path'ler:")
-        print("  - script klasoru / r_update.json")
-        print("  - cwd / r_update.json")
-        print("  - /storage/emulated/0/[Download[s]/]r_update.json")
         return 1
 
-    age_sec = time.time() - rj.stat().st_mtime
-    age_min = age_sec / 60
-    if age_min < 5:
-        age_tag = f"{age_min:.1f} dk -- TAZE"
-    elif age_min < 30:
-        age_tag = f"{age_min:.0f} dk -- eski"
-    else:
-        age_tag = f"{age_min:.0f} dk -- COK ESKI, auto_fetch CALISTIR"
+    age_min = (time.time() - rj.stat().st_mtime) / 60
+    age_tag = (f"{age_min:.1f} dk -- TAZE" if age_min < 5
+               else f"{age_min:.0f} dk -- eski" if age_min < 30
+               else f"{age_min:.0f} dk -- COK ESKI")
 
     with open(rj, encoding="utf-8") as f:
         data = json.load(f)
@@ -245,89 +252,126 @@ def main():
     price = d1h.get("current_price") or d5m.get("current_price", 0)
     whale = d1h.get("whale_acct_ls")
     ls    = d1h.get("taker_ls_ratio")
-    p4    = d4h.get("current_price")
-    ma30  = d4h.get("ma30")
-    depl  = ((p4 - ma30) / ma30 * 100) if (p4 and ma30 and ma30 > 0) else None
 
     bar = "=" * 76
     print()
     print(bar)
-    print(f"  LEADING KARAR v5  -  ${price:,.0f}")
-    print(f"  Notion empirik (n=35) + live overlay + V4 overlay-only kural")
+    print(f"  LEADING KARAR v6  -  ${price:,.0f}")
+    print(f"  Sayisal puan sistemi (esik +/-{KARAR_ESIK})")
     print(bar)
     print(f"  Kaynak : {rj}")
     print(f"  Mtime  : {age_tag}")
     if age_min > 30:
-        print(f"  ⚠ UYARI: r_update.json {age_min:.0f} dk eski. Once auto_fetch calistir.")
+        print(f"  ⚠ UYARI: r_update.json {age_min:.0f} dk eski. auto_fetch CALISTIR.")
     print(bar)
     print()
 
-    # 1) Empirik
-    print("  1) EMPIRIK (Notion n=35)")
+    # === Tier 1: LIVE ===
+    tier1 = [
+        score_depth(d1h),
+        score_cvd_5m(d5m),
+        score_funding(d1h, candles),
+    ]
+    # === Tier 2: STRUCTURE ===
+    s_depl, depl_val, t_depl = score_depl(d4h)
+    tier2 = [
+        score_ls_1h(d1h),
+        score_whale(d1h),
+        (s_depl, t_depl),
+    ]
+    # === Tier 3: DIVERGENCE / MOMENTUM ===
+    tier3 = []
+    s, t = score_divergence(d5m, d1h)
+    if t: tier3.append((s, t))
+    s, t = score_ls_slope(d1h)
+    if t: tier3.append((s, t))
+    s, t = score_oi_momentum(d1h, candles)
+    if t: tier3.append((s, t))
+    # === Tier 4: EMPIRIK BONUS ===
+    s_emp, t_emp = empirik_bonus(
+        float(whale) if whale is not None else None,
+        float(ls) if ls is not None else None,
+        depl_val,
+    )
+
+    print("  TIER 1 — LIVE (orderbook + tape + funding)")
     print("  " + "-" * 72)
-    if depl is not None:
-        print(f"  whale={whale}  LS_1h={ls}  depl_4h={depl:+.2f}%")
-    else:
-        print(f"  whale={whale}  LS_1h={ls}  depl=YOK")
-    emp = empirik_karar(whale, ls, depl)
-    yon_emp, pct, n, kural = emp
-    if yon_emp:
-        print(f"  >>> {kural} -> {yon_emp} (%{pct} historic, n={n})")
-    else:
-        print(f"  >>> {kural}")
+    t1_total = 0.0
+    for s, t in tier1:
+        print(f"  {s:>+5.2f}  {t}")
+        t1_total += s
+    print(f"  Tier 1 toplam: {t1_total:+.2f}")
 
-    # 2) Overlay
     print()
-    print("  2) LIVE OVERLAY")
+    print("  TIER 2 — STRUCTURE (LS, whale, depl)")
     print("  " + "-" * 72)
-    d_v, d_y, d_g = ov_depth(d1h)
-    c_v, c_y, c_g = ov_cvd(d5m)
-    f_v, f_y, f_g, f_d = ov_funding(d1h, candles)
-    o_v, o_y, o_d = ov_oi(d1h, candles)
+    t2_total = 0.0
+    for s, t in tier2:
+        print(f"  {s:>+5.2f}  {t}")
+        t2_total += s
+    print(f"  Tier 2 toplam: {t2_total:+.2f}")
 
-    def mk(y):
-        return {"LONG":"[+]","SHORT":"[-]","NOTR":"[ ]","NO_DATA":"[?]"}.get(y,"[?]")
-
-    print(f"  {mk(d_y)} depth   -> {d_y:<5} ({d_g:<6})  {d_v:.2f}")
-    print(f"  {mk(c_y)} CVD 5m  -> {c_y:<5} ({c_g:<6})  {c_v:+,.0f}")
-    if f_v is not None:
-        ext = f" ({f_d})" if f_d else ""
-        print(f"  {mk(f_y)} funding -> {f_y:<5} ({f_g:<6})  {f_v:+.1f}% APR{ext}")
-    else:
-        print(f"  {mk(f_y)} funding -> NO_DATA")
-    if o_v is not None:
-        print(f"  {mk(o_y)} OI mom. -> {o_y:<5} ({o_d})  oi={o_v:+.0f}")
-    else:
-        print(f"  {mk(o_y)} OI mom. -> NO_DATA")
-
-    sigs = [(d_y, d_g), (c_y, c_g), (f_y, f_g), (o_y, "—")]
-    ov_long  = sum(1 for y, g in sigs if y == "LONG")
-    ov_short = sum(1 for y, g in sigs if y == "SHORT")
-    g_long  = sum(1 for y, g in sigs if y == "LONG"  and g == "GUCLU")
-    g_short = sum(1 for y, g in sigs if y == "SHORT" and g == "GUCLU")
     print()
-    print(f"  Sayim: LONG={ov_long} (GUCLU={g_long})  "
-          f"SHORT={ov_short} (GUCLU={g_short})")
+    if tier3:
+        print("  TIER 3 — DIVERGENCE / MOMENTUM")
+        print("  " + "-" * 72)
+        t3_total = 0.0
+        for s, t in tier3:
+            print(f"  {s:>+5.2f}  {t}")
+            t3_total += s
+        print(f"  Tier 3 toplam: {t3_total:+.2f}")
+    else:
+        t3_total = 0.0
+        print("  TIER 3 — DIVERGENCE / MOMENTUM (sinyal yok)")
+        print("  " + "-" * 72)
 
-    # 3) Final
+    print()
+    if t_emp:
+        print("  TIER 4 — EMPIRIK BONUS (Notion n=35)")
+        print("  " + "-" * 72)
+        print(f"  {s_emp:>+5.2f}  {t_emp}")
+    t4_total = s_emp
+
+    grand = t1_total + t2_total + t3_total + t4_total
+
     print()
     print(bar)
-    print("  >>> FINAL KARAR")
+    print(f"  TOPLAM PUAN: {grand:+.2f}  /  10  (esik +/-{KARAR_ESIK})")
     print(bar)
-    karar, etiket, sebep, boyut = final_karar(emp, ov_long, ov_short, g_long, g_short)
-    print(f"  {karar}  ({etiket})")
-    print(f"  Sebep : {sebep}")
-    if boyut != "—":
-        print(f"  Boyut : {boyut}")
-
     print()
-    print("  DURUSTLUK:")
-    print(f"    - Empirik baseline: %68.6 UP (Notion R2-R42 sample LONG-bias)")
-    print(f"    - V4 yeni kural: empirik yok ama overlay 2+ LONG -> DIKKATLI LONG")
-    print(f"    - SHORT esigi 3+ (P79: SHORT %67 < LONG %95)")
-    no_d = sum(1 for y, _ in sigs if y == "NO_DATA")
-    if no_d:
-        print(f"    - {no_d}/4 overlay sinyalde veri yok")
+
+    # === KARAR ===
+    if grand >= KARAR_ESIK:
+        karar = "GIR LONG"
+        yon = "LONG"
+    elif grand <= -KARAR_ESIK:
+        karar = "GIR SHORT"
+        yon = "SHORT"
+    else:
+        karar = "BEKLE"
+        yon = None
+
+    print(f"  >>> KARAR: {karar}")
+
+    if yon:
+        # Boyut hesapla
+        risk_pct = abs(grand) / 10.0 * 2.0
+        risk_pct = min(risk_pct, 2.0)
+        lev = abs(grand) / 10.0 * 5.0
+        lev = max(min(lev, 5.0), 1.0)
+        print(f"  Risk    : %{risk_pct:.2f} bakiye")
+        print(f"  Kaldirac: max {lev:.1f}x")
+        print(f"  SL hint : ATR x 1.0  (auto_fetch verisinden hesaplanir)")
+        print(f"  TP hint : ATR x 2.0  (R:R = 2.0)")
+    else:
+        gap = KARAR_ESIK - abs(grand)
+        if grand > 0:
+            print(f"  Yon LONG ama puan {grand:+.2f} -- esik +{KARAR_ESIK}'a {gap:.2f} uzak")
+        elif grand < 0:
+            print(f"  Yon SHORT ama puan {grand:+.2f} -- esik -{KARAR_ESIK}'e {gap:.2f} uzak")
+        else:
+            print(f"  Sinyaller dengeli (puan 0) -- piyasa kararsiz")
+        print(f"  POZISYON ACMA. Sonraki snapshot'a bak.")
 
     print()
     print(bar)
