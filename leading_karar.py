@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """
-leading_karar.py  v4  -  TEK FINAL KARAR (Notion + Live + Overlay-only)
+leading_karar.py  v5  -  TEK FINAL KARAR + dosya tarihi kontrolu
 ========================================================================
+V5 DEGISIKLIK (May 2 23:30 — Eren bug bildirimi):
+  - find_r_update artik EN YENI mtime'li dosyayi seciyor (eskiden ilk bulduguna donerdi)
+  - /storage/emulated/0/r_update.json path eklendi (root'taki dosya)
+  - Cikti'da hangi dosyayi okudugu + kac dk eski yazar
+  - 30 dk'dan eski ise UYARI (auto_fetch calistir)
 
 KAYNAK:
   Empirik kalibre = Notion Runs (R2-R42, n=35 kapali, CSV backtest)
@@ -59,15 +64,21 @@ OI_THR          = 100
 
 
 def find_r_update():
-    for p in [
+    """En yeni mtime'li r_update.json'u sec.
+    Birden fazla dosya varsa eski olanlari atla."""
+    candidates = [
         Path(__file__).parent / "r_update.json",
         Path.cwd() / "r_update.json",
+        Path("/storage/emulated/0/r_update.json"),
         Path("/storage/emulated/0/Download/r_update.json"),
         Path("/storage/emulated/0/Downloads/r_update.json"),
-    ]:
-        if p.is_file():
-            return p
-    return None
+    ]
+    existing = [p for p in candidates if p.is_file()]
+    if not existing:
+        return None
+    # En yeni mtime
+    existing.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return existing[0]
 
 
 # ============================================================
@@ -204,10 +215,24 @@ def final_karar(emp, ov_long, ov_short, g_long, g_short):
 # ============================================================
 
 def main():
+    import time
     rj = find_r_update()
     if not rj:
         print("HATA: r_update.json yok. Once auto_fetch.py / auto_compact_fixed.py")
+        print("Aranan path'ler:")
+        print("  - script klasoru / r_update.json")
+        print("  - cwd / r_update.json")
+        print("  - /storage/emulated/0/[Download[s]/]r_update.json")
         return 1
+
+    age_sec = time.time() - rj.stat().st_mtime
+    age_min = age_sec / 60
+    if age_min < 5:
+        age_tag = f"{age_min:.1f} dk -- TAZE"
+    elif age_min < 30:
+        age_tag = f"{age_min:.0f} dk -- eski"
+    else:
+        age_tag = f"{age_min:.0f} dk -- COK ESKI, auto_fetch CALISTIR"
 
     with open(rj, encoding="utf-8") as f:
         data = json.load(f)
@@ -227,8 +252,13 @@ def main():
     bar = "=" * 76
     print()
     print(bar)
-    print(f"  LEADING KARAR v4  -  ${price:,.0f}")
+    print(f"  LEADING KARAR v5  -  ${price:,.0f}")
     print(f"  Notion empirik (n=35) + live overlay + V4 overlay-only kural")
+    print(bar)
+    print(f"  Kaynak : {rj}")
+    print(f"  Mtime  : {age_tag}")
+    if age_min > 30:
+        print(f"  ⚠ UYARI: r_update.json {age_min:.0f} dk eski. Once auto_fetch calistir.")
     print(bar)
     print()
 
