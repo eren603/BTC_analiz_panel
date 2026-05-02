@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """
-leading_karar.py  v6.1  -  SAYISAL TEK KARAR (Notion n=35 backtest kalibre)
+leading_karar.py  v7  -  LONG-ONLY 2. GORUS (Notion backtest kalibre)
 ========================================================================
 
-V6.1 DEGISIKLIK (May 2 — Notion CSV n=35 backtest sonrasi):
+V7 DEGISIKLIK (May 2 — Eren karari):
+  - SHORT karar TAMAMEN KALDIRILDI. Notion P79: LONG %95, SHORT %67.
+    Script artik SHORT acmak icin sinyal vermez.
+  - Sadece 2 cikti: GIR LONG / BEKLE
+  - Rol: SECONDARY OPINION. Eren karar_motoru/auto_compact'tan
+    kararsiz kalirsa BU SCRIPTI LONG icin ikinci goz olarak kullanir.
+  - SHORT kararlari icin Eren ESKI sistemi kullanir (karar_motoru + entry_trigger).
+
+V6.1 (onceki):
   - LONG esik +6 -> +4.0 (kanit: backtest %100 dogru, n=8/35)
-  - SHORT esik -6 -> -3.0 (asimetrik: P79 SHORT zayif, kati esik)
-  - Eski +6 esigi PARTIAL backtest'te HIC fire etmedi (script bos donerdi)
+  - SHORT esik -6 -> -3.0 (artik kullanilmiyor)
 
 V6 (orijinal):
   - Hedge dili kaldirildi. "DIKKATLI/ORTA/KUCUK" yok.
@@ -32,8 +39,10 @@ PUAN BILESENLERI (her biri -3..+3):
 
 KARAR ESIGI (Notion n=35 backtest kalibrasyon):
   toplam >= +4.0  ->  GIR LONG   (backtest: 8/8 dogru, 100%)
-  toplam <= -3.0  ->  GIR SHORT  (asimetrik kati, P79 dersi)
-  arasi          ->  BEKLE
+  diger          ->  BEKLE      (puan negatif olsa bile SHORT vermez!)
+
+  Negatif puan = "LONG icin guven yok" anlamina gelir, SHORT karari DEGIL.
+  SHORT trade dusunuyorsan: karar_motoru + entry_trigger kullan, BU SCRIPT DEGIL.
 
 BOYUT (otomatik):
   risk_pct  = abs(skor) / 10 * 2.0  (max %2 bakiye risk)
@@ -60,8 +69,8 @@ FUND_EXTREME = 5.0
 FUND_WEAK    = 1.5
 OI_MIN       = 100
 
-KARAR_ESIK_LONG  = 4.0   # Notion n=35 backtest %100 (n=8) — kanitli
-KARAR_ESIK_SHORT = -3.0  # Asimetrik: SHORT yapisal zayif (P79), kati esik
+KARAR_ESIK_LONG = 4.0   # Notion n=35 backtest %100 (n=8) — kanitli
+# V7: SHORT esigi YOK. Script LONG-only ikinci gorus.
 
 
 def find_r_update():
@@ -261,8 +270,9 @@ def main():
     bar = "=" * 76
     print()
     print(bar)
-    print(f"  LEADING KARAR v6.1  -  ${price:,.0f}")
-    print(f"  Esik: LONG +{KARAR_ESIK_LONG} / SHORT {KARAR_ESIK_SHORT} (Notion n=35 backtest)")
+    print(f"  LEADING KARAR v7  -  ${price:,.0f}")
+    print(f"  LONG-ONLY 2. GORUS  |  Esik: LONG +{KARAR_ESIK_LONG} (Notion n=35 backtest)")
+    print(f"  SHORT icin: bu script kullanma -> karar_motoru + entry_trigger")
     print(bar)
     print(f"  Kaynak : {rj}")
     print(f"  Mtime  : {age_tag}")
@@ -341,17 +351,14 @@ def main():
 
     print()
     print(bar)
-    print(f"  TOPLAM PUAN: {grand:+.2f}  /  10  (LONG>=+{KARAR_ESIK_LONG} | SHORT<={KARAR_ESIK_SHORT})")
+    print(f"  TOPLAM PUAN: {grand:+.2f}  /  10  (GIR LONG esik: +{KARAR_ESIK_LONG})")
     print(bar)
     print()
 
-    # === KARAR ===
+    # === KARAR (V7: LONG-only) ===
     if grand >= KARAR_ESIK_LONG:
         karar = "GIR LONG"
         yon = "LONG"
-    elif grand <= KARAR_ESIK_SHORT:
-        karar = "GIR SHORT"
-        yon = "SHORT"
     else:
         karar = "BEKLE"
         yon = None
@@ -359,25 +366,22 @@ def main():
     print(f"  >>> KARAR: {karar}")
 
     if yon:
-        # Boyut: hedef esik (LONG=+4, SHORT=-3) gore normalize, max %2 risk, max 5x kaldirac
-        target = KARAR_ESIK_LONG if yon == "LONG" else abs(KARAR_ESIK_SHORT)
-        ratio = min(abs(grand) / target, 2.0)  # esikten 2x daha guclu olabilir
-        risk_pct = min(0.5 + ratio * 0.75, 2.0)  # esikte %1.25, 2x esikte %2
-        lev = min(2.0 + ratio * 1.5, 5.0)        # esikte 3.1x, 2x esikte 5x
+        # Boyut: esikten 2x guclu olabilir, max %2 risk, max 5x kaldirac
+        ratio = min(grand / KARAR_ESIK_LONG, 2.0)
+        risk_pct = min(0.5 + ratio * 0.75, 2.0)
+        lev = min(2.0 + ratio * 1.5, 5.0)
         print(f"  Risk    : %{risk_pct:.2f} bakiye")
         print(f"  Kaldirac: max {lev:.1f}x")
         print(f"  SL hint : ATR x 1.0  (auto_fetch ATR verisi)")
         print(f"  TP hint : ATR x 2.0  (R:R = 2.0)")
     else:
-        if grand > 0:
+        if grand >= 0:
             gap = KARAR_ESIK_LONG - grand
-            print(f"  Yon LONG egiliminde ama puan {grand:+.2f} -- esik +{KARAR_ESIK_LONG}'a {gap:.2f} uzak")
-        elif grand < 0:
-            gap = abs(KARAR_ESIK_SHORT) - abs(grand)
-            print(f"  Yon SHORT egiliminde ama puan {grand:+.2f} -- esik {KARAR_ESIK_SHORT}'a {gap:.2f} uzak")
+            print(f"  LONG icin puan {grand:+.2f} -- esik +{KARAR_ESIK_LONG}'a {gap:.2f} uzak")
+            print(f"  POZISYON ACMA. (LONG icin yetersiz kanit)")
         else:
-            print(f"  Sinyaller dengeli (puan 0) -- piyasa kararsiz")
-        print(f"  POZISYON ACMA.")
+            print(f"  LONG icin guven yok (puan {grand:+.2f}) -- sinyaller LONG'a karsi")
+            print(f"  POZISYON ACMA. (Bu script SHORT karari VERMEZ -- karar_motoru kullan)")
 
     print()
     print(bar)
