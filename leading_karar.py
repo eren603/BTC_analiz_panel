@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
-leading_karar.py  v6  -  SAYISAL TEK KARAR (hedge yok)
+leading_karar.py  v6.1  -  SAYISAL TEK KARAR (Notion n=35 backtest kalibre)
 ========================================================================
 
-V6 DEGISIKLIK (May 2 — Eren karari: secenek C):
+V6.1 DEGISIKLIK (May 2 — Notion CSV n=35 backtest sonrasi):
+  - LONG esik +6 -> +4.0 (kanit: backtest %100 dogru, n=8/35)
+  - SHORT esik -6 -> -3.0 (asimetrik: P79 SHORT zayif, kati esik)
+  - Eski +6 esigi PARTIAL backtest'te HIC fire etmedi (script bos donerdi)
+
+V6 (orijinal):
   - Hedge dili kaldirildi. "DIKKATLI/ORTA/KUCUK" yok.
-  - SAYISAL puan -10..+10 araligi. Esik +/-6.
-  - 3 tek karar: GIR LONG / BEKLE / GIR SHORT
+  - SAYISAL puan, 3 tek karar: GIR LONG / BEKLE / GIR SHORT
   - Yeni sinyaller: CVD divergence, ls_slope, oi_momentum
-  - Boyut puana gore otomatik (manuel etiket yok)
+  - Boyut puana gore otomatik
 
 PUAN BILESENLERI (her biri -3..+3):
   Tier 1 LIVE (max ±5):
@@ -26,9 +30,9 @@ PUAN BILESENLERI (her biri -3..+3):
   Tier 4 EMPIRIK BONUS:
     - Notion R1-R5 fired                        : +1 ek
 
-KARAR ESIGI:
-  toplam >= +6.0  ->  GIR LONG
-  toplam <= -6.0  ->  GIR SHORT
+KARAR ESIGI (Notion n=35 backtest kalibrasyon):
+  toplam >= +4.0  ->  GIR LONG   (backtest: 8/8 dogru, 100%)
+  toplam <= -3.0  ->  GIR SHORT  (asimetrik kati, P79 dersi)
   arasi          ->  BEKLE
 
 BOYUT (otomatik):
@@ -56,7 +60,8 @@ FUND_EXTREME = 5.0
 FUND_WEAK    = 1.5
 OI_MIN       = 100
 
-KARAR_ESIK = 6.0
+KARAR_ESIK_LONG  = 4.0   # Notion n=35 backtest %100 (n=8) — kanitli
+KARAR_ESIK_SHORT = -3.0  # Asimetrik: SHORT yapisal zayif (P79), kati esik
 
 
 def find_r_update():
@@ -256,8 +261,8 @@ def main():
     bar = "=" * 76
     print()
     print(bar)
-    print(f"  LEADING KARAR v6  -  ${price:,.0f}")
-    print(f"  Sayisal puan sistemi (esik +/-{KARAR_ESIK})")
+    print(f"  LEADING KARAR v6.1  -  ${price:,.0f}")
+    print(f"  Esik: LONG +{KARAR_ESIK_LONG} / SHORT {KARAR_ESIK_SHORT} (Notion n=35 backtest)")
     print(bar)
     print(f"  Kaynak : {rj}")
     print(f"  Mtime  : {age_tag}")
@@ -336,15 +341,15 @@ def main():
 
     print()
     print(bar)
-    print(f"  TOPLAM PUAN: {grand:+.2f}  /  10  (esik +/-{KARAR_ESIK})")
+    print(f"  TOPLAM PUAN: {grand:+.2f}  /  10  (LONG>=+{KARAR_ESIK_LONG} | SHORT<={KARAR_ESIK_SHORT})")
     print(bar)
     print()
 
     # === KARAR ===
-    if grand >= KARAR_ESIK:
+    if grand >= KARAR_ESIK_LONG:
         karar = "GIR LONG"
         yon = "LONG"
-    elif grand <= -KARAR_ESIK:
+    elif grand <= KARAR_ESIK_SHORT:
         karar = "GIR SHORT"
         yon = "SHORT"
     else:
@@ -354,24 +359,25 @@ def main():
     print(f"  >>> KARAR: {karar}")
 
     if yon:
-        # Boyut hesapla
-        risk_pct = abs(grand) / 10.0 * 2.0
-        risk_pct = min(risk_pct, 2.0)
-        lev = abs(grand) / 10.0 * 5.0
-        lev = max(min(lev, 5.0), 1.0)
+        # Boyut: hedef esik (LONG=+4, SHORT=-3) gore normalize, max %2 risk, max 5x kaldirac
+        target = KARAR_ESIK_LONG if yon == "LONG" else abs(KARAR_ESIK_SHORT)
+        ratio = min(abs(grand) / target, 2.0)  # esikten 2x daha guclu olabilir
+        risk_pct = min(0.5 + ratio * 0.75, 2.0)  # esikte %1.25, 2x esikte %2
+        lev = min(2.0 + ratio * 1.5, 5.0)        # esikte 3.1x, 2x esikte 5x
         print(f"  Risk    : %{risk_pct:.2f} bakiye")
         print(f"  Kaldirac: max {lev:.1f}x")
-        print(f"  SL hint : ATR x 1.0  (auto_fetch verisinden hesaplanir)")
+        print(f"  SL hint : ATR x 1.0  (auto_fetch ATR verisi)")
         print(f"  TP hint : ATR x 2.0  (R:R = 2.0)")
     else:
-        gap = KARAR_ESIK - abs(grand)
         if grand > 0:
-            print(f"  Yon LONG ama puan {grand:+.2f} -- esik +{KARAR_ESIK}'a {gap:.2f} uzak")
+            gap = KARAR_ESIK_LONG - grand
+            print(f"  Yon LONG egiliminde ama puan {grand:+.2f} -- esik +{KARAR_ESIK_LONG}'a {gap:.2f} uzak")
         elif grand < 0:
-            print(f"  Yon SHORT ama puan {grand:+.2f} -- esik -{KARAR_ESIK}'e {gap:.2f} uzak")
+            gap = abs(KARAR_ESIK_SHORT) - abs(grand)
+            print(f"  Yon SHORT egiliminde ama puan {grand:+.2f} -- esik {KARAR_ESIK_SHORT}'a {gap:.2f} uzak")
         else:
             print(f"  Sinyaller dengeli (puan 0) -- piyasa kararsiz")
-        print(f"  POZISYON ACMA. Sonraki snapshot'a bak.")
+        print(f"  POZISYON ACMA.")
 
     print()
     print(bar)
