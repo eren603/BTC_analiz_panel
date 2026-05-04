@@ -135,8 +135,10 @@ def show_device_info() -> None:
     if cores:
         cprint(f"CPU: {cores} çekirdek  {('· ' + model) if model else ''}", C.CY)
 
+    disk_info = None
     try:
-        st = shutil.disk_usage(str(sdcard_root()))
+        disk_info = shutil.disk_usage(str(sdcard_root()))
+        st = disk_info
         pct = st.used * 100.0 / st.total
         bar_len = 30
         filled = int(bar_len * pct / 100)
@@ -155,18 +157,45 @@ def show_device_info() -> None:
     bat_pct, bat_status = _read_battery()
     if bat_pct:
         cprint(f"\nPil:  %{bat_pct}  ({bat_status or 'bilinmiyor'})", C.M)
+    else:
+        cprint("\nPil:  bilgi okunamadı (Pydroid sandbox)", C.DIM)
+
+    _print_health_summary(fields, disk_info)
+
+
+def _print_health_summary(mem: dict, disk) -> None:
+    cprint("\n── SAĞLIK ÖZETİ ──", C.B)
+    if mem.get("MemTotal"):
+        used_pct = (mem["MemTotal"] - mem["MemAvailable"]) * 100.0 / mem["MemTotal"]
+        if used_pct < 70:
+            cprint("  ✅ RAM: rahat", C.G)
+        elif used_pct < 85:
+            cprint("  ⚠️  RAM: orta — arka plan uygulamalarını kapat", C.Y)
+        else:
+            cprint("  🔴 RAM: dolu — yeniden başlat öneriliyor", C.RD)
+    if disk:
+        try:
+            free_gb = disk.free / 1024**3
+            if free_gb > 5:
+                cprint(f"  ✅ Depolama: {free_gb:.1f} GB boş, ferah", C.G)
+            elif free_gb > 2:
+                cprint(f"  ⚠️  Depolama: {free_gb:.1f} GB boş — temizle", C.Y)
+            else:
+                cprint(f"  🔴 Depolama: {free_gb:.1f} GB boş — kritik!", C.RD)
+        except Exception:
+            pass
 
 
 def _read_battery() -> tuple[str, str]:
-    for base in (
-        "/sys/class/power_supply/battery",
-        "/sys/class/power_supply/Battery",
-        "/sys/class/power_supply/BAT0",
-        "/sys/class/power_supply/bms",
-    ):
-        cap = read_proc(f"{base}/capacity").strip()
-        if cap:
-            return cap, read_proc(f"{base}/status").strip()
+    psu = "/sys/class/power_supply"
+    try:
+        subs = os.listdir(psu)
+    except OSError:
+        subs = []
+    for sub in subs:
+        cap = read_proc(f"{psu}/{sub}/capacity").strip()
+        if cap and cap.isdigit():
+            return cap, read_proc(f"{psu}/{sub}/status").strip()
     rc, out = run_shell(["dumpsys", "battery"], timeout=4)
     if rc == 0 and out:
         pct = ""
@@ -180,6 +209,12 @@ def _read_battery() -> tuple[str, str]:
                 st = {"2": "Charging", "3": "Discharging", "4": "Not charging", "5": "Full"}.get(code, code)
         if pct:
             return pct, st
+    rc, out = run_shell(["sh", "-c", "termux-battery-status"], timeout=3)
+    if rc == 0 and "percentage" in out:
+        m = re.search(r'"percentage"\s*:\s*(\d+)', out)
+        s = re.search(r'"status"\s*:\s*"([^"]+)"', out)
+        if m:
+            return m.group(1), (s.group(1) if s else "")
     return "", ""
 
 
@@ -210,24 +245,23 @@ def trim_memory() -> None:
     if not trim_ok:
         cprint("  ⚠  Android 11+ root'suz trim'i engelliyor — atlandı", C.DIM)
 
-    cprint("\nKayıp objeleri ayıkla (Python heap)...", C.Y)
     import ctypes
     try:
         ctypes.CDLL("libc.so").malloc_trim(0)
-        cprint("  ✓ glibc malloc_trim çağrıldı (heap fragmanları toplandı)", C.G)
+        cprint("  ✓ Native heap fragmanları toplandı", C.G)
     except (OSError, AttributeError):
-        cprint("  ⚠  malloc_trim yok (Android bionic) — atlandı", C.DIM)
+        pass
 
-    cprint("\n'drop_caches' deneniyor...", C.Y)
     try:
         with open("/proc/sys/vm/drop_caches", "w", encoding="utf-8") as f:
             f.write("3\n")
-        cprint("  ✓ Sayfa önbelleği bırakıldı", C.G)
+        cprint("  ✓ Sayfa önbelleği bırakıldı (root)", C.G)
     except (OSError, PermissionError):
-        cprint("  ⚠  Root yok, atlandı (normal)", C.DIM)
+        pass
 
-    cprint("\nÖneri: arka plan uygulamalarını kapatmak için Son Kullanılanlar", C.CY)
-    cprint("       ekranından 'Tümünü Kapat'a bas — bu en etkili RAM rahatlatma.", C.CY)
+    cprint("\n💡 EN ETKİLİ ADIM:", C.B + C.Y)
+    cprint("   Son Kullanılanlar (kare ☐) → 'Tümünü Kapat'", C.Y)
+    cprint("   Bu, script'in yapabileceğinden çok daha fazla RAM boşaltır.", C.DIM)
 
 
 # ---------- 3) Python / Pydroid önbellek temizliği ----------
@@ -270,7 +304,12 @@ def clean_python_cache() -> None:
         except OSError:
             continue
 
-    cprint(f"  ✓ {removed} öğe silindi  ({human_size(total)} kazanıldı)", C.G)
+    if removed == 0:
+        cprint("  ✓ Silinecek önbellek yok — Pydroid temiz ✨", C.G)
+        cprint("  ℹ Diğer uygulamaların önbelleğine Android sandbox erişim vermez.", C.DIM)
+        cprint("    Sistem önbelleği için: Ayarlar → Depolama → Önbelleği temizle", C.DIM)
+    else:
+        cprint(f"  ✓ {removed} öğe silindi  ({human_size(total)} kazanıldı)", C.G)
 
 
 # ---------- 4) Junk dosya tarayıcı ----------
