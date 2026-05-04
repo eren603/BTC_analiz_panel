@@ -152,10 +152,35 @@ def show_device_info() -> None:
     except OSError:
         pass
 
-    bat = read_proc("/sys/class/power_supply/battery/capacity")
-    bst = read_proc("/sys/class/power_supply/battery/status")
-    if bat.strip():
-        cprint(f"\nPil:  %{bat.strip()}  ({bst.strip() or 'bilinmiyor'})", C.M)
+    bat_pct, bat_status = _read_battery()
+    if bat_pct:
+        cprint(f"\nPil:  %{bat_pct}  ({bat_status or 'bilinmiyor'})", C.M)
+
+
+def _read_battery() -> tuple[str, str]:
+    for base in (
+        "/sys/class/power_supply/battery",
+        "/sys/class/power_supply/Battery",
+        "/sys/class/power_supply/BAT0",
+        "/sys/class/power_supply/bms",
+    ):
+        cap = read_proc(f"{base}/capacity").strip()
+        if cap:
+            return cap, read_proc(f"{base}/status").strip()
+    rc, out = run_shell(["dumpsys", "battery"], timeout=4)
+    if rc == 0 and out:
+        pct = ""
+        st = ""
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("level:"):
+                pct = line.split(":", 1)[1].strip()
+            elif line.startswith("status:"):
+                code = line.split(":", 1)[1].strip()
+                st = {"2": "Charging", "3": "Discharging", "4": "Not charging", "5": "Full"}.get(code, code)
+        if pct:
+            return pct, st
+    return "", ""
 
 
 # ---------- 2) RAM trim ----------
@@ -169,20 +194,40 @@ def trim_memory() -> None:
     cprint(f"  ✓ {n} obje serbest bırakıldı", C.G)
 
     pkg = os.environ.get("PYDROID_PKG") or "ru.iiec.pydroid3"
-    cprint("\nKendi sürecimize TRIM_MEMORY_COMPLETE sinyali gönderiliyor...", C.Y)
-    rc, out = run_shell(["am", "send-trim-memory", pkg, "COMPLETE"])
-    if rc == 0:
-        cprint("  ✓ Sinyal başarıyla gönderildi", C.G)
-    else:
-        cprint(f"  ⚠  am komutu başarısız ({rc}): {out[:80]}", C.DIM)
+    cprint("\nTRIM_MEMORY sinyali deneniyor (3 yöntem)...", C.Y)
+    trim_attempts = [
+        ["cmd", "activity", "send-trim-memory", pkg, "COMPLETE"],
+        ["am", "send-trim-memory", pkg, "COMPLETE"],
+        ["am", "send-trim-memory", pkg, "MODERATE"],
+    ]
+    trim_ok = False
+    for cmd in trim_attempts:
+        rc, out = run_shell(cmd)
+        if rc == 0 and "Failure" not in out and "Error" not in out:
+            cprint(f"  ✓ Başarılı: {' '.join(cmd[:3])}", C.G)
+            trim_ok = True
+            break
+    if not trim_ok:
+        cprint("  ⚠  Android 11+ root'suz trim'i engelliyor — atlandı", C.DIM)
 
-    cprint("\n'kswapd' tetikleniyor (drop_caches denemesi)...", C.Y)
+    cprint("\nKayıp objeleri ayıkla (Python heap)...", C.Y)
+    import ctypes
+    try:
+        ctypes.CDLL("libc.so").malloc_trim(0)
+        cprint("  ✓ glibc malloc_trim çağrıldı (heap fragmanları toplandı)", C.G)
+    except (OSError, AttributeError):
+        cprint("  ⚠  malloc_trim yok (Android bionic) — atlandı", C.DIM)
+
+    cprint("\n'drop_caches' deneniyor...", C.Y)
     try:
         with open("/proc/sys/vm/drop_caches", "w", encoding="utf-8") as f:
             f.write("3\n")
         cprint("  ✓ Sayfa önbelleği bırakıldı", C.G)
     except (OSError, PermissionError):
         cprint("  ⚠  Root yok, atlandı (normal)", C.DIM)
+
+    cprint("\nÖneri: arka plan uygulamalarını kapatmak için Son Kullanılanlar", C.CY)
+    cprint("       ekranından 'Tümünü Kapat'a bas — bu en etkili RAM rahatlatma.", C.CY)
 
 
 # ---------- 3) Python / Pydroid önbellek temizliği ----------
@@ -229,36 +274,50 @@ def clean_python_cache() -> None:
 
 
 # ---------- 4) Junk dosya tarayıcı ----------
-JUNK_EXT = (".tmp", ".log", ".bak", ".crdownload", ".part")
-JUNK_DIRS = (".thumbnails", ".cache", "Logs", "log", "tmp")
+JUNK_EXT = (".tmp", ".log", ".bak", ".crdownload", ".part", ".dmp", ".trace")
+JUNK_DIRS = (".thumbnails", ".cache", "Logs", "log", "tmp", "bugreports", ".trashed")
+OLD_DOWNLOAD_EXT = (".apk", ".zip", ".rar", ".7z", ".iso", ".dmg")
+OLD_DAYS = 30
 
 
 def scan_junk(do_delete: bool) -> None:
     header(f"{'JUNK SİL' if do_delete else 'JUNK TARA'}")
     root = sdcard_root()
-    cprint(f"Tarama kökü: {root}\n", C.DIM)
+    cprint(f"Tarama kökü: {root}", C.DIM)
+    cprint(f"Eski-büyük arşiv eşiği: {OLD_DAYS} gün, .apk/.zip/.rar...\n", C.DIM)
 
+    now = time.time()
     found: list[tuple[Path, int]] = []
+    download_dir = (root / "Download").resolve()
+
     for r, dirs, files in os.walk(root, onerror=lambda e: None):
         rp = Path(r)
-        if any(part.startswith(".") and part not in (".thumbnails", ".cache") for part in rp.parts):
+        if any(part.startswith(".") and part not in (".thumbnails", ".cache", ".trashed") for part in rp.parts):
             dirs[:] = []
             continue
         if rp.name in JUNK_DIRS:
             try:
                 size = sum(f.stat().st_size for f in rp.rglob("*") if f.is_file())
-                found.append((rp, size))
+                if size > 0:
+                    found.append((rp, size))
             except OSError:
                 pass
             dirs[:] = []
             continue
+        in_download = str(rp.resolve()).startswith(str(download_dir))
         for fn in files:
-            if fn.lower().endswith(JUNK_EXT):
-                p = rp / fn
-                try:
-                    found.append((p, p.stat().st_size))
-                except OSError:
-                    pass
+            p = rp / fn
+            low = fn.lower()
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            if low.endswith(JUNK_EXT):
+                found.append((p, st.st_size))
+            elif in_download and low.endswith(OLD_DOWNLOAD_EXT):
+                age_days = (now - st.st_mtime) / 86400
+                if age_days >= OLD_DAYS:
+                    found.append((p, st.st_size))
 
     if not found:
         cprint("  Junk bulunamadı. Telefonun zaten temiz görünüyor ✨", C.G)
