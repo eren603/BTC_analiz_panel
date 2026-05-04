@@ -1,5 +1,5 @@
 """
-Android Hızlandırıcı - Pydroid 3 Uyumlu (Root Gerektirmez)
+Android Hızlandırıcı v4 - Pydroid 3 Uyumlu (Root Gerektirmez)
 
 Telefonunuzu hızlandırmak için güvenli, sandbox-içi optimizasyonlar yapar:
   - RAM trim sinyali gönderir (kendi sürecimiz + sistem önerisi)
@@ -480,10 +480,13 @@ def run_all() -> None:
 
 
 # ---------- Menü ----------
+VERSION = "v4 (2026-05-04)"
+
+
 def menu() -> None:
     while True:
         cprint("\n" + "═" * 44, C.M)
-        cprint("   ANDROID HIZLANDIRICI  ·  Pydroid 3", C.B + C.M)
+        cprint(f"   ANDROID HIZLANDIRICI {VERSION}", C.B + C.M)
         cprint("═" * 44, C.M)
         items = [
             ("1", "Cihaz durumunu göster"),
